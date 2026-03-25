@@ -19,5 +19,7 @@ AGENTS.md
 # Experimental code/artifacts
 dev/
 
-# Results file
+# Results files
 results.tsv
+backtest_results.tsv
+backtest_results_best.json
