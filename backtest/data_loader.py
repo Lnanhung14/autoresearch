@@ -110,7 +110,7 @@ def download_yahoo(symbols: List[str], start: str = "2020-01-01",
                 os.makedirs(save_dir, exist_ok=True)
                 safe_name = symbol.replace('.', '_').replace('/', '_')
                 df.to_csv(os.path.join(save_dir, f"{safe_name}.csv"), index=False)
-                print(f"  Saved {symbol} → {safe_name}.csv ({len(df)} rows)")
+                print(f"  Saved {symbol} -> {safe_name}.csv ({len(df)} rows)")
 
         except Exception as e:
             print(f"  [WARN] Failed to download {symbol}: {e}")

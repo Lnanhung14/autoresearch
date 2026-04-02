@@ -119,18 +119,18 @@ Examples:
     stock_data = {}
 
     if args.demo:
-        print("\n📈 Using demo data (5 synthetic stocks)")
+        print("\n[INFO] Using demo data (5 synthetic stocks)")
         for i, name in enumerate(["STOCK_A", "STOCK_B", "STOCK_C", "STOCK_D", "STOCK_E"]):
             stock_data[name] = generate_sample_data(name, days=500, start_price=100 + i * 50, seed=42 + i)
         print(f"   Generated {len(stock_data)} stocks, ~500 days each")
 
     elif args.data_dir:
-        print(f"\n📈 Loading CSVs from: {args.data_dir}")
+        print(f"\n[INFO] Loading CSVs from: {args.data_dir}")
         stock_data = load_stock_folder(args.data_dir)
         print(f"   Loaded {len(stock_data)} stocks")
 
     elif args.csv:
-        print(f"\n📈 Loading single CSV: {args.csv}")
+        print(f"\n[INFO] Loading single CSV: {args.csv}")
         symbol = os.path.splitext(os.path.basename(args.csv))[0]
         stock_data[symbol] = load_csv(args.csv)
         print(f"   Loaded {symbol}: {len(stock_data[symbol])} rows")
@@ -139,23 +139,23 @@ Examples:
         symbols = []
         if args.watchlist:
             symbols = load_watchlist(args.watchlist)
-            print(f"\n📈 Loaded watchlist: {len(symbols)} symbols from {args.watchlist}")
+            print(f"\n[INFO] Loaded watchlist: {len(symbols)} symbols from {args.watchlist}")
         if args.yahoo:  # explicit symbols provided
             symbols.extend(args.yahoo.split(","))
         if not symbols:
             # Default Taiwan blue chips for demo
             symbols = ["2330.TW", "2317.TW", "2454.TW", "2308.TW", "3711.TW",
                        "2882.TW", "2881.TW", "1301.TW", "2891.TW", "2303.TW"]
-            print(f"\n📈 No symbols specified, using Taiwan top 10: {symbols}")
+            print(f"\n[INFO] No symbols specified, using Taiwan top 10: {symbols}")
         else:
-            print(f"\n📈 Downloading {len(symbols)} stocks from Yahoo Finance")
+            print(f"\n[INFO] Downloading {len(symbols)} stocks from Yahoo Finance")
 
         stock_data = download_yahoo(symbols, start=args.start_date, save_dir=args.save_data)
         print(f"   Downloaded {len(stock_data)} stocks successfully")
 
     elif args.watchlist:
         symbols = load_watchlist(args.watchlist)
-        print(f"\n📈 Watchlist loaded ({len(symbols)} symbols), downloading from Yahoo Finance...")
+        print(f"\n[INFO] Watchlist loaded ({len(symbols)} symbols), downloading from Yahoo Finance...")
         stock_data = download_yahoo(symbols, start=args.start_date, save_dir=args.save_data)
         print(f"   Downloaded {len(stock_data)} stocks successfully")
 
@@ -188,7 +188,7 @@ Examples:
     result = optimizer.optimize()
     elapsed = time.time() - start_time
 
-    print(f"\n⏱️  Total time: {elapsed:.1f}s ({result.total_experiments} experiments)")
+    print(f"\n[耗時]  總計: {elapsed:.1f} 秒 ({result.total_experiments} 次實驗)")
 
     # Save final best config as JSON for easy reuse
     best_config = {
@@ -210,7 +210,7 @@ Examples:
     best_config_file = args.output.replace('.tsv', '_best.json')
     with open(best_config_file, 'w', encoding='utf-8') as f:
         json.dump(best_config, f, indent=2, ensure_ascii=False)
-    print(f"   Best config saved to: {best_config_file}")
+    print(f"   最佳策略設定已儲存至: {best_config_file}")
 
 
 if __name__ == "__main__":

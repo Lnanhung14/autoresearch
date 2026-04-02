@@ -28,6 +28,20 @@ from pathlib import Path
 from .strategies import STRATEGY_REGISTRY, StrategyDef, StrategyParam, get_strategy
 from .engine import run_backtest, run_backtest_multi_stock, BacktestResult
 
+import sys as _sys
+
+_original_print = print
+
+def _safe_print(*args, **kwargs):
+    """Print that silently ignores BrokenPipeError (Streamlit subprocess)."""
+    try:
+        _original_print(*args, **kwargs)
+        _sys.stdout.flush()
+    except BrokenPipeError:
+        pass
+
+print = _safe_print
+
 
 @dataclass
 class OptimizationConfig:
@@ -42,16 +56,26 @@ class OptimizationConfig:
     results_file: str = "backtest_results.tsv"
     # Strategies to include (None = all)
     strategies: Optional[List[str]] = None
-    # Max parameter combinations per strategy in grid search
-    max_combos_per_strategy: int = 200
+    # Max parameter combinations per strategy in grid search (0=不限制)
+    max_combos_per_strategy: int = 0
+    # 時間預算 (秒), 0=不限制, 由 patience 控制收斂
+    time_budget_seconds: int = 0
     # Hill-climbing: max iterations without improvement before stopping
-    patience: int = 30
+    patience: int = 50
     # Hill-climbing: number of neighbors to sample per iteration
-    neighbors_per_step: int = 5
+    neighbors_per_step: int = 8
     # Commission and tax rates
     commission_rate: float = 0.001425
     tax_rate: float = 0.003
     slippage: float = 0.001
+    # 風險管理
+    stop_loss: float = 0.0       # 停損比例 (0.15 = 15%), 0=不啟用
+    take_profit: float = 0.0     # 停利比例 (0.30 = 30%), 0=不啟用
+    max_hold_days: int = 0       # 最大持有天數, 0=不限制
+    # 賣出策略
+    trailing_stop: float = 0.0   # 移動停利 (0.08 = 從高點回落8%), 0=不啟用
+    partial_exit: bool = False   # 分批出場
+    partial_exit_last_mode: str = "trailing"  # 最後1/3: "trailing"=移動停利, "ma5"=破5日均線
 
 
 @dataclass
@@ -86,57 +110,127 @@ class BacktestOptimizer:
 
     def optimize(self) -> OptimizationResult:
         """
-        Run full optimization: coarse scan → fine-tune → converge.
-        Returns the best strategy + parameters found.
+        Run full optimization — autoresearch 風格:
+        Phase 1: 全策略粗掃描 (預設參數)
+        Phase 2: Top-N 策略全覽/隨機網格搜尋 (不限組合數)
+        Phase 3: 爬山法精細微調 (patience 控制收斂)
+        Phase 4: 持續爬山直到時間到或收斂 (NEVER STOP 精神)
+
+        時間預算: time_budget_seconds > 0 時啟用
         """
+        self._start_time = time.time()
+
+        time_info = ""
+        if self.config.time_budget_seconds > 0:
+            time_info = f" | 時間預算: {self.config.time_budget_seconds}秒"
+        combo_info = "不限制" if self.config.max_combos_per_strategy <= 0 else f"上限{self.config.max_combos_per_strategy}"
+
         print("=" * 70)
-        print("🔬 Stock Backtest Optimizer (autoresearch-style hill climbing)")
-        print(f"   Stocks: {len(self.stock_data)} | Metric: {self.config.primary_metric}")
-        print(f"   Strategies: {self._get_strategy_names()}")
+        print("🔬 回測策略最佳化引擎 (autoresearch 爬山法)")
+        print(f"   股票: {len(self.stock_data)} 檔 | 指標: {self.config.primary_metric}{time_info}")
+        print(f"   策略: {len(self._get_strategy_names())} 個 | 參數搜尋: {combo_info}")
+        print(f"   爬山法: patience={self.config.patience} neighbors={self.config.neighbors_per_step}")
+        if self.config.trailing_stop > 0:
+            print(f"   移動停利: 回落 {self.config.trailing_stop:.0%}")
+        if self.config.partial_exit:
+            print(f"   分批出場: 漲10%出1/3, 漲20%出1/3, 剩餘移動停利")
         print("=" * 70)
 
-        # Phase 1: Coarse scan - test all strategies with default params
-        print("\n📊 Phase 1: Coarse scan across all strategies (default params)")
+        # Phase 1: 全策略粗掃描
+        print("\n📊 階段 1: 全策略粗掃描 (預設參數)")
         print("-" * 50)
         self._phase1_coarse_scan()
 
         if self.best_strategy is None:
-            print("\n[ERROR] No valid results from any strategy. Check your data.")
+            print("\n[ERROR] 無有效結果，請檢查資料")
             return self._make_result()
 
-        print(f"\n  ✅ Phase 1 best: {self.best_strategy} | "
-              f"win_rate={self.best_metric:.2%}")
+        print(f"\n  ✅ 階段 1 最佳: {self.best_strategy} | "
+              f"{self.config.primary_metric}={self.best_metric:.2%}")
 
-        # Phase 2: Grid search on best strategy's parameters
-        print(f"\n📊 Phase 2: Parameter grid search for [{self.best_strategy}]")
-        print("-" * 50)
-        self._phase2_grid_search(self.best_strategy)
-        print(f"\n  ✅ Phase 2 best: {self.best_strategy} | "
-              f"win_rate={self.best_metric:.2%} | params={self.best_params}")
+        if self._is_time_up():
+            return self._finalize()
 
-        # Phase 3: Hill-climbing fine-tune around best params
-        print(f"\n📊 Phase 3: Hill-climbing refinement")
+        # Phase 2: 對所有策略 (不只 top-3) 做網格搜尋
+        all_strategies = self._get_strategy_names()
+        # 先搜尋 Phase 1 的 best，再搜其他
+        search_order = [self.best_strategy] + [s for s in all_strategies if s != self.best_strategy]
+
+        for idx, strat_name in enumerate(search_order):
+            if self._is_time_up():
+                print(f"\n  ⏰ 時間到，已搜尋 {idx}/{len(search_order)} 策略")
+                break
+            print(f"\n📊 階段 2: [{strat_name}] 參數搜尋 ({idx+1}/{len(search_order)})")
+            print("-" * 50)
+            self._phase2_grid_search(strat_name)
+
+        print(f"\n  ✅ 階段 2 最佳: {self.best_strategy} | "
+              f"{self.config.primary_metric}={self.best_metric:.2%} | params={self.best_params}")
+
+        if self._is_time_up():
+            return self._finalize()
+
+        # Phase 3: 爬山法精細微調
+        print(f"\n📊 階段 3: 爬山法精細微調 [{self.best_strategy}]")
         print("-" * 50)
         self._phase3_hill_climb()
-        print(f"\n  ✅ Phase 3 best: {self.best_strategy} | "
-              f"win_rate={self.best_metric:.2%} | params={self.best_params}")
+        print(f"\n  ✅ 階段 3 最佳: {self.best_strategy} | "
+              f"{self.config.primary_metric}={self.best_metric:.2%} | params={self.best_params}")
 
-        # Also try top-3 strategies from Phase 1 for grid search
-        top_strategies = self._get_top_n_strategies(3)
-        for strat_name in top_strategies:
-            if strat_name != self.best_strategy:
-                print(f"\n📊 Extra: Grid search for [{strat_name}]")
-                print("-" * 50)
-                self._phase2_grid_search(strat_name)
+        if self._is_time_up():
+            return self._finalize()
 
-        # Final hill-climb on overall best
-        print(f"\n📊 Final hill-climbing on best: [{self.best_strategy}]")
+        # Phase 4: Autoresearch 式持續搜尋 — NEVER STOP
+        # 交替: 對 top-5 做爬山 → 對 best 做深度爬山 → 重複
+        print(f"\n📊 階段 4: 持續最佳化 (autoresearch NEVER STOP)")
         print("-" * 50)
-        self._phase3_hill_climb()
+        round_count = 0
+        while not self._is_time_up():
+            round_count += 1
+            prev_best = self.best_metric
 
-        # Save results
+            # 對 top-5 策略各做一輪爬山
+            top_strats = self._get_top_n_strategies(5)
+            for strat in top_strats:
+                if self._is_time_up():
+                    break
+                # 暫時切換到該策略做爬山
+                saved_strategy = self.best_strategy
+                saved_params = self.best_params
+                saved_metric = self.best_metric
+
+                # 取該策略在 Phase 1/2 的最佳參數
+                strat_best = self._get_strategy_best_params(strat)
+                if strat_best:
+                    self.best_strategy = strat
+                    self.best_params = strat_best
+                    self._phase3_hill_climb()
+
+                    # 如果沒有改善，還原
+                    if self.best_metric <= saved_metric:
+                        self.best_strategy = saved_strategy
+                        self.best_params = saved_params
+                        self.best_metric = saved_metric
+
+            # 再對全局 best 做深度爬山
+            if not self._is_time_up():
+                self._phase3_hill_climb()
+
+            elapsed = time.time() - self._start_time
+            if self.best_metric > prev_best:
+                print(f"  🔄 第 {round_count} 輪 | 改善! {prev_best:.2%} → {self.best_metric:.2%} | {elapsed:.0f}秒")
+            else:
+                print(f"  🔄 第 {round_count} 輪 | 無改善 ({self.best_metric:.2%}) | {elapsed:.0f}秒")
+                # 若無時間限制，在無改善後停止
+                if self.config.time_budget_seconds <= 0:
+                    print(f"  收斂! 無進一步改善，停止搜尋")
+                    break
+
+        return self._finalize()
+
+    def _finalize(self) -> OptimizationResult:
+        """儲存結果並回傳"""
         self._save_results()
-
         result = self._make_result()
         self._print_final_report(result)
         return result
@@ -157,6 +251,12 @@ class BacktestOptimizer:
             commission_rate=self.config.commission_rate,
             tax_rate=self.config.tax_rate,
             slippage=self.config.slippage,
+            stop_loss=self.config.stop_loss,
+            take_profit=self.config.take_profit,
+            max_hold_days=self.config.max_hold_days,
+            trailing_stop=self.config.trailing_stop,
+            partial_exit=self.config.partial_exit,
+            partial_exit_last_mode=self.config.partial_exit_last_mode,
         )
 
         # Filter results with minimum trades
@@ -210,7 +310,8 @@ class BacktestOptimizer:
         log_entry = {
             'experiment': self.experiment_count,
             'strategy': strategy_name,
-            'params': str(params),
+            'params': params.copy(),  # 保留原始 dict 供 _get_strategy_best_params 使用
+            'params_str': str(params),
             'win_rate': primary,
             'sharpe': secondary,
             'avg_return': avg_return,
@@ -242,6 +343,23 @@ class BacktestOptimizer:
     # Phase 2: Grid search (smart sampling for large search spaces)
     # ------------------------------------------------------------------
 
+    def _is_time_up(self) -> bool:
+        """檢查是否超過時間預算"""
+        if self.config.time_budget_seconds <= 0:
+            return False
+        return (time.time() - self._start_time) >= self.config.time_budget_seconds
+
+    # 每個策略的取樣上限 (根據搜尋空間大小智能分配)
+    # 組合數 ≤1350 → 全覽搜尋; >1350 → 依策略分配取樣數
+    STRATEGY_SAMPLE_LIMITS = {
+        'multi_factor': 200,              # 12,012 組 → 1.7%
+        'kd_macd_signal': 500,            # 26,400 組 → 0.8%
+        'dual_ma_rsi': 500,               # 37,422 組 → 0.5%
+        'chip_sedimentation_inst': 200,   # 173,712 組 → 0.1%
+        'chip_sedimentation': 200,        # 5,765,760 組 → 0.003%
+        'chip_sedimentation_rising': 1000, # 8,072,064 組 → 0.002%
+    }
+
     def _phase2_grid_search(self, strategy_name: str):
         strategy_def = get_strategy(strategy_name)
         param_ranges = {p.name: p.range() for p in strategy_def.params}
@@ -251,25 +369,52 @@ class BacktestOptimizer:
         for vals in param_ranges.values():
             total_combos *= len(vals)
 
-        if total_combos <= self.config.max_combos_per_strategy:
-            # Exhaustive grid search
+        # 決定搜尋方式: 全覽 or 隨機取樣
+        # 1) 使用者設定的上限 (0=不限制)
+        user_max = self.config.max_combos_per_strategy
+        # 2) 策略專屬取樣上限
+        strategy_max = self.STRATEGY_SAMPLE_LIMITS.get(strategy_name, 0)
+
+        # 全覽門檻: 組合數 ≤1350 → 一定全覽
+        FULL_SCAN_THRESHOLD = 1350
+
+        if total_combos <= FULL_SCAN_THRESHOLD:
+            # 全覽搜尋 (小搜尋空間)
             combos = list(itertools.product(*param_ranges.values()))
             param_names = list(param_ranges.keys())
-            print(f"  Exhaustive grid: {total_combos} combinations")
+            coverage = 100.0
+            print(f"  ✅ 全覽搜尋: {total_combos} 組參數 | 覆蓋率 {coverage:.0f}%")
             for combo in combos:
+                if self._is_time_up():
+                    print(f"  ⏰ 時間到，已搜尋部分")
+                    return
                 params = dict(zip(param_names, combo))
-                # Skip invalid combos (e.g., fast > slow period)
                 if not self._validate_params(strategy_name, params):
                     continue
                 self._try_experiment(strategy_name, params, f"grid search")
         else:
-            # Random sampling from grid
-            print(f"  Random sampling {self.config.max_combos_per_strategy} "
-                  f"from {total_combos} combinations")
+            # 隨機取樣 (大搜尋空間)
+            # 取樣數 = 策略專屬上限 > 使用者上限 > 總數
+            if strategy_max > 0:
+                sample_size = strategy_max
+            elif user_max > 0:
+                sample_size = min(user_max, total_combos)
+            else:
+                sample_size = min(500, total_combos)  # 預設 500
+
+            coverage = sample_size / total_combos * 100
+            print(f"  隨機搜尋 {sample_size} 組 (共 {total_combos:,} 組) | 覆蓋率 {coverage:.1f}%")
             param_names = list(param_ranges.keys())
             rng = np.random.RandomState(42)
             seen = set()
-            for _ in range(self.config.max_combos_per_strategy):
+            sampled = 0
+            max_attempts = sample_size * 5  # 避免無限迴圈
+            for _ in range(max_attempts):
+                if sampled >= sample_size:
+                    break
+                if self._is_time_up():
+                    print(f"  ⏰ 時間到，已搜尋 {sampled} 組")
+                    return
                 combo = tuple(rng.choice(vals) for vals in param_ranges.values())
                 key = tuple(round(v, 4) for v in combo)
                 if key in seen:
@@ -279,6 +424,7 @@ class BacktestOptimizer:
                 if not self._validate_params(strategy_name, params):
                     continue
                 self._try_experiment(strategy_name, params, f"random grid sample")
+                sampled += 1
 
     def _validate_params(self, strategy_name: str, params: Dict[str, float]) -> bool:
         """Validate parameter constraints (e.g., fast < slow period)."""
@@ -297,7 +443,10 @@ class BacktestOptimizer:
     def _phase3_hill_climb(self):
         """
         Hill-climbing around the current best parameters.
-        Mirrors autoresearch's greedy keep/discard loop.
+        Mirrors autoresearch's greedy keep/discard loop:
+        - 改善 → KEEP (更新 best)
+        - 未改善 → DISCARD (不更新)
+        - patience 次未改善 → 收斂
         """
         if not self.best_strategy or not self.best_params:
             return
@@ -309,6 +458,9 @@ class BacktestOptimizer:
         iteration = 0
 
         while no_improvement_count < self.config.patience:
+            if self._is_time_up():
+                print(f"  ⏰ 時間到，爬山在第 {iteration} 輪中斷")
+                return
             iteration += 1
             improved_this_round = False
 
@@ -318,6 +470,8 @@ class BacktestOptimizer:
             )
 
             for neighbor_params in neighbors:
+                if self._is_time_up():
+                    return
                 if not self._validate_params(self.best_strategy, neighbor_params):
                     continue
                 if self._try_experiment(self.best_strategy, neighbor_params,
@@ -329,8 +483,7 @@ class BacktestOptimizer:
             else:
                 no_improvement_count += 1
 
-        print(f"  Converged after {iteration} iterations "
-              f"({self.config.patience} without improvement)")
+        print(f"  收斂: {iteration} 輪 (連續 {self.config.patience} 輪無改善)")
 
     def _generate_neighbors(self, current_params: Dict[str, float],
                              param_defs: Dict[str, StrategyParam],
@@ -375,6 +528,16 @@ class BacktestOptimizer:
                 strat_best[strat] = wr
         sorted_strats = sorted(strat_best.items(), key=lambda x: x[1], reverse=True)
         return [s[0] for s in sorted_strats[:n]]
+
+    def _get_strategy_best_params(self, strategy_name: str) -> Optional[Dict[str, float]]:
+        """取得某策略在歷史實驗中的最佳參數"""
+        best_wr = -float('inf')
+        best_params = None
+        for entry in self.results_log:
+            if entry['strategy'] == strategy_name and entry['win_rate'] > best_wr:
+                best_wr = entry['win_rate']
+                best_params = entry.get('params')
+        return best_params
 
     def _save_results(self):
         """Save all results to TSV file."""

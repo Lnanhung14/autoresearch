@@ -88,11 +88,11 @@ def fetch_multiple_stocks(
             df = fetch_historical_data(symbol, api_key, start_date, end_date)
             if len(df) >= 30:
                 stock_data[symbol] = df
-                print(f"  ✓ {symbol}: {len(df)} days loaded")
+                print(f"  [OK] {symbol}: {len(df)} days loaded")
             else:
-                print(f"  ✗ {symbol}: insufficient data ({len(df)} days)")
+                print(f"  [SKIP] {symbol}: insufficient data ({len(df)} days)")
         except Exception as e:
-            print(f"  ✗ {symbol}: {e}")
+            print(f"  [FAIL] {symbol}: {e}")
 
         if i < len(symbols) - 1:
             time.sleep(delay)
